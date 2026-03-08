@@ -910,6 +910,7 @@ const WIDGETS = {
     hasApiKey: false,
     properties: {
       title: 'AI Usage',
+      server: 'local',
       providers: 'all',
       hideUnauthenticated: true,
       showPlan: true,
@@ -931,15 +932,34 @@ const WIDGETS = {
         </div>
       </div>`,
     generateJs: (props) => `
-      // AI Usage Widget: ${props.id}
+      // AI Usage Widget: ${props.id} — ${props.server === 'local' ? 'local' : 'remote: ' + props.server}
       async function update_${props.id.replace(/-/g, '_')}() {
         const content = document.getElementById('${props.id}-content');
         const badge = document.getElementById('${props.id}-badge');
         try {
+          const serverId = '${props.server || 'local'}';
           const providers = '${props.providers || 'all'}';
-          const url = providers === 'all' ? '/api/ai-usage' : '/api/ai-usage/' + providers;
-          const res = await fetch(url);
-          const json = await res.json();
+          let json;
+          
+          if (serverId === 'local') {
+            // Local: fetch from /api/ai-usage
+            const url = providers === 'all' ? '/api/ai-usage' : '/api/ai-usage/' + providers;
+            const res = await fetch(url);
+            json = await res.json();
+          } else {
+            // Remote: fetch from server stats endpoint
+            const res = await fetch('/api/servers/' + serverId + '/stats');
+            const data = await res.json();
+            if (data.error) {
+              json = { status: 'error', message: data.error };
+            } else if (data.aiUsage && data.aiUsage.providers) {
+              json = { status: 'ok', providers: data.aiUsage.providers };
+            } else if (data.aiUsage === undefined) {
+              json = { status: 'error', message: 'AI usage not enabled on remote agent (enableAiUsage: false)' };
+            } else {
+              json = { status: 'error', message: 'No AI providers found on remote server' };
+            }
+          }
           
           if (json.status !== 'ok') {
             content.innerHTML = '<div style="color:#f85149;font-size:12px;">' + _esc(json.message || 'Error') + '</div>';
