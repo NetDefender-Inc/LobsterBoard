@@ -446,6 +446,7 @@ const WIDGETS = {
     apiKeyName: 'OPENCLAW_API',
     properties: {
       title: 'Auth Type',
+      server: 'local',
       endpoint: '/api/status',
       refreshInterval: 30
     },
@@ -465,15 +466,25 @@ const WIDGETS = {
         </div>
       </div>`,
     generateJs: (props) => `
-      // Auth Status Widget: ${props.id}
+      // Auth Status Widget: ${props.id} — ${props.server === 'local' ? 'local' : 'remote: ' + props.server}
       async function update_${props.id.replace(/-/g, '_')}() {
+        const serverId = '${props.server || 'local'}';
+        const dot = document.getElementById('${props.id}-dot');
+        const val = document.getElementById('${props.id}-value');
         try {
-          const res = await fetch('/api/auth');
-          const data = await res.json();
-          const dot = document.getElementById('${props.id}-dot');
-          const val = document.getElementById('${props.id}-value');
-          if (data.status === 'ok') {
-            const isMonthly = data.mode === 'Monthly';
+          let authData;
+          if (serverId === 'local') {
+            const res = await fetch('/api/auth');
+            authData = await res.json();
+          } else {
+            const res = await fetch('/api/servers/' + serverId + '/stats');
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            if (!data.openclaw?.auth) throw new Error('Auth data not available');
+            authData = { status: 'ok', mode: data.openclaw.auth.mode };
+          }
+          if (authData.status === 'ok' || authData.mode) {
+            const isMonthly = authData.mode === 'Monthly';
             val.textContent = isMonthly ? 'Max' : 'API';
             dot.className = 'kpi-indicator ' + (isMonthly ? 'green' : 'yellow');
           } else {
@@ -481,7 +492,7 @@ const WIDGETS = {
           }
         } catch (e) {
           console.error('Auth status widget error:', e);
-          document.getElementById('${props.id}-value').textContent = '—';
+          val.textContent = '—';
         }
       }
       update_${props.id.replace(/-/g, '_')}();
@@ -858,6 +869,7 @@ const WIDGETS = {
     apiKeyName: 'OPENCLAW_API',
     properties: {
       title: 'Today',
+      server: 'local',
       endpoint: '/api/today',
       maxItems: 10,
       refreshInterval: 60
@@ -881,13 +893,22 @@ const WIDGETS = {
         </div>
       </div>`,
     generateJs: (props) => `
-      // Activity List Widget: ${props.id} (Today style)
+      // Activity List Widget: ${props.id} — ${props.server === 'local' ? 'local' : 'remote: ' + props.server}
       async function update_${props.id.replace(/-/g, '_')}() {
+        const serverId = '${props.server || 'local'}';
+        const list = document.getElementById('${props.id}-list');
+        const badge = document.getElementById('${props.id}-badge');
         try {
-          const res = await fetch('${props.endpoint || '/api/today'}');
-          const data = await res.json();
-          const list = document.getElementById('${props.id}-list');
-          const badge = document.getElementById('${props.id}-badge');
+          let data;
+          if (serverId === 'local') {
+            const res = await fetch('${props.endpoint || '/api/today'}');
+            data = await res.json();
+          } else {
+            const res = await fetch('/api/servers/' + serverId + '/stats');
+            const stats = await res.json();
+            if (stats.error) throw new Error(stats.error);
+            data = stats.openclaw?.today || { date: new Date().toISOString().split('T')[0], activities: [] };
+          }
 
           if (data.date && badge) {
             const d = new Date(data.date + 'T12:00:00');
@@ -910,7 +931,10 @@ const WIDGETS = {
               '<div style="flex-shrink:0;font-size:0.85em;color:#8b949e;margin-left:8px;">' + _esc(icon) + ' ' + source + '</div>' +
             '</div>';
           }).join('');
-        } catch (e) { console.error('Today widget error:', e); }
+        } catch (e) { 
+          console.error('Today widget error:', e);
+          list.innerHTML = '<div style="padding:8px;color:#f85149;font-size:calc(12px * var(--font-scale,1));">Error: ' + _esc(e.message) + '</div>';
+        }
       }
       update_${props.id.replace(/-/g, '_')}();
       setInterval(update_${props.id.replace(/-/g, '_')}, ${(props.refreshInterval || 60) * 1000});
@@ -1468,6 +1492,7 @@ const WIDGETS = {
     hasApiKey: false,
     properties: {
       title: 'Cron',
+      server: 'local',
       endpoint: '/api/cron',
       columns: 1,
       refreshInterval: 30
@@ -1489,14 +1514,24 @@ const WIDGETS = {
         </div>
       </div>`,
     generateJs: (props) => `
-      // Cron Jobs Widget: ${props.id}
+      // Cron Jobs Widget: ${props.id} — ${props.server === 'local' ? 'local' : 'remote: ' + props.server}
       async function update_${props.id.replace(/-/g, '_')}() {
+        const serverId = '${props.server || 'local'}';
+        const list = document.getElementById('${props.id}-list');
+        const badge = document.getElementById('${props.id}-badge');
         try {
-          const res = await fetch('${props.endpoint || '/api/cron'}');
-          const json = await res.json();
-          const jobs = json.jobs || [];
-          const list = document.getElementById('${props.id}-list');
-          const badge = document.getElementById('${props.id}-badge');
+          let jobs;
+          if (serverId === 'local') {
+            const res = await fetch('${props.endpoint || '/api/cron'}');
+            const json = await res.json();
+            jobs = json.jobs || [];
+          } else {
+            const res = await fetch('/api/servers/' + serverId + '/stats');
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            if (!data.openclaw?.cron) throw new Error('Cron data not available');
+            jobs = data.openclaw.cron.jobs || [];
+          }
           if (!jobs.length) {
             list.innerHTML = '<div class="cron-item"><span class="cron-name" style="opacity:0.5;">No cron jobs found</span></div>';
             badge.textContent = '0';
@@ -1524,7 +1559,7 @@ const WIDGETS = {
           badge.textContent = jobs.length + ' jobs';
         } catch (e) {
           console.error('Cron jobs widget error:', e);
-          document.getElementById('${props.id}-list').innerHTML = '<div class="cron-item"><span class="cron-name">Error loading</span></div>';
+          list.innerHTML = '<div class="cron-item"><span class="cron-name">Error: ' + _esc(e.message) + '</span></div>';
         }
       }
       update_${props.id.replace(/-/g, '_')}();
@@ -1543,6 +1578,7 @@ const WIDGETS = {
     hasApiKey: false,
     properties: {
       title: 'System Log',
+      server: 'local',
       endpoint: '/api/system-log',
       maxLines: 50,
       refreshInterval: 10
@@ -1575,20 +1611,29 @@ const WIDGETS = {
         if (level === 'OK') return 'ok';
         return 'info';
       }
+      // System Log Widget: ${props.id} — ${props.server === 'local' ? 'local' : 'remote: ' + props.server}
       async function update_${props.id.replace(/-/g, '_')}() {
+        const serverId = '${props.server || 'local'}';
         try {
-          const res = await fetch('${props.endpoint || '/api/system-log'}?max=${props.maxLines || 50}');
-          const json = await res.json();
-          // Handle both new format (json.entries) and old format (json.lines)
-          let entries = json.entries || [];
-          if (!entries.length && json.lines && json.lines.length) {
-            entries = json.lines.map(line => {
-              let level = 'INFO';
-              if (/\\b(error|fatal)\\b/i.test(line)) level = 'ERROR';
-              else if (/\\bwarn/i.test(line)) level = 'WARN';
-              else if (/\\b(ok|success|ready|started)\\b/i.test(line)) level = 'OK';
-              return { time: new Date().toISOString(), level, category: 'system', message: line };
-            });
+          let entries = [];
+          if (serverId === 'local') {
+            const res = await fetch('${props.endpoint || '/api/system-log'}?max=${props.maxLines || 50}');
+            const json = await res.json();
+            entries = json.entries || [];
+            if (!entries.length && json.lines && json.lines.length) {
+              entries = json.lines.map(line => {
+                let level = 'INFO';
+                if (/\\b(error|fatal)\\b/i.test(line)) level = 'ERROR';
+                else if (/\\bwarn/i.test(line)) level = 'WARN';
+                else if (/\\b(ok|success|ready|started)\\b/i.test(line)) level = 'OK';
+                return { time: new Date().toISOString(), level, category: 'system', message: line };
+              });
+            }
+          } else {
+            const res = await fetch('/api/servers/' + serverId + '/stats');
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            entries = data.openclaw?.systemLog?.entries || [];
           }
           const log = document.getElementById('${props.id}-log');
           const badge = document.getElementById('${props.id}-badge');
@@ -2153,6 +2198,7 @@ const WIDGETS = {
     apiKeyName: 'OPENCLAW_API',
     properties: {
       title: 'Sessions',
+      server: 'local',
       endpoint: '/api/sessions',
       refreshInterval: 30
     },
@@ -2171,13 +2217,23 @@ const WIDGETS = {
         </div>
       </div>`,
     generateJs: (props) => `
-      // Session Count Widget: ${props.id}
+      // Session Count Widget: ${props.id} — ${props.server === 'local' ? 'local' : 'remote: ' + props.server}
       async function update_${props.id.replace(/-/g, '_')}() {
+        const serverId = '${props.server || 'local'}';
         try {
-          const res = await fetch('${props.endpoint || '/api/sessions'}');
-          const json = await res.json();
-          const data = json.data || json;
-          document.getElementById('${props.id}-count').textContent = data.active || data.length || 0;
+          let count;
+          if (serverId === 'local') {
+            const res = await fetch('${props.endpoint || '/api/sessions'}');
+            const json = await res.json();
+            const data = json.data || json;
+            count = data.active || data.length || 0;
+          } else {
+            const res = await fetch('/api/servers/' + serverId + '/stats');
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            count = data.openclaw?.sessions?.active || data.openclaw?.sessions?.recent24h || 0;
+          }
+          document.getElementById('${props.id}-count').textContent = count;
         } catch (e) {
           document.getElementById('${props.id}-count').textContent = '—';
         }
