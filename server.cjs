@@ -1817,6 +1817,141 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ─────────────────────────────────────────────
+  // Server Profiles API (for remote LobsterBoard Agent connections)
+  // ─────────────────────────────────────────────
+  const SERVERS_FILE = path.join(__dirname, 'data', 'servers.json');
+  
+  function loadServers() {
+    try {
+      if (fs.existsSync(SERVERS_FILE)) {
+        return JSON.parse(fs.readFileSync(SERVERS_FILE, 'utf8'));
+      }
+    } catch (e) { /* ignore */ }
+    return [{ id: 'local', name: 'Local', type: 'local' }];
+  }
+  
+  function saveServers(servers) {
+    fs.mkdirSync(path.dirname(SERVERS_FILE), { recursive: true });
+    fs.writeFileSync(SERVERS_FILE, JSON.stringify(servers, null, 2));
+  }
+
+  // GET /api/servers - List all servers
+  if (req.method === 'GET' && pathname === '/api/servers') {
+    const servers = loadServers();
+    // Mask API keys for security
+    const masked = servers.map(s => ({
+      ...s,
+      apiKey: s.apiKey ? s.apiKey.slice(0, 10) + '...' : undefined
+    }));
+    sendJson(res, 200, { servers: masked });
+    return;
+  }
+
+  // POST /api/servers - Add a server
+  if (req.method === 'POST' && pathname === '/api/servers') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      try {
+        const { name, url, apiKey } = JSON.parse(body);
+        if (!name || !url || !apiKey) {
+          return sendJson(res, 400, { error: 'name, url, and apiKey required' });
+        }
+        const servers = loadServers();
+        const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+        if (servers.find(s => s.id === id)) {
+          return sendJson(res, 400, { error: 'Server with this name already exists' });
+        }
+        servers.push({ id, name, url, apiKey, type: 'remote' });
+        saveServers(servers);
+        sendJson(res, 200, { status: 'success', id });
+      } catch (e) {
+        sendJson(res, 400, { error: e.message });
+      }
+    });
+    return;
+  }
+
+  // PUT /api/servers/:id - Update a server
+  if (req.method === 'PUT' && pathname.startsWith('/api/servers/')) {
+    const id = pathname.split('/')[3];
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      try {
+        const updates = JSON.parse(body);
+        const servers = loadServers();
+        const idx = servers.findIndex(s => s.id === id);
+        if (idx === -1) return sendJson(res, 404, { error: 'Server not found' });
+        if (id === 'local') return sendJson(res, 400, { error: 'Cannot modify local server' });
+        servers[idx] = { ...servers[idx], ...updates, id }; // Don't allow id change
+        saveServers(servers);
+        sendJson(res, 200, { status: 'success' });
+      } catch (e) {
+        sendJson(res, 400, { error: e.message });
+      }
+    });
+    return;
+  }
+
+  // DELETE /api/servers/:id - Delete a server
+  if (req.method === 'DELETE' && pathname.startsWith('/api/servers/')) {
+    const id = pathname.split('/')[3];
+    if (id === 'local') return sendJson(res, 400, { error: 'Cannot delete local server' });
+    const servers = loadServers();
+    const filtered = servers.filter(s => s.id !== id);
+    if (filtered.length === servers.length) {
+      return sendJson(res, 404, { error: 'Server not found' });
+    }
+    saveServers(filtered);
+    sendJson(res, 200, { status: 'success' });
+    return;
+  }
+
+  // POST /api/servers/:id/test - Test connection to a server
+  if (req.method === 'POST' && pathname.match(/^\/api\/servers\/[^/]+\/test$/)) {
+    const id = pathname.split('/')[3];
+    const servers = loadServers();
+    const server = servers.find(s => s.id === id);
+    if (!server) return sendJson(res, 404, { error: 'Server not found' });
+    if (server.type === 'local') {
+      return sendJson(res, 200, { status: 'ok', message: 'Local server' });
+    }
+    // Test remote connection
+    fetch(server.url + '/health', {
+      headers: { 'X-API-Key': server.apiKey },
+      signal: AbortSignal.timeout(5000),
+    })
+      .then(r => r.json())
+      .then(data => sendJson(res, 200, { status: 'ok', serverName: data.serverName }))
+      .catch(e => sendJson(res, 200, { status: 'error', message: e.message }));
+    return;
+  }
+
+  // GET /api/servers/:id/stats - Fetch stats from a remote server
+  if (req.method === 'GET' && pathname.match(/^\/api\/servers\/[^/]+\/stats$/)) {
+    const id = pathname.split('/')[3];
+    const servers = loadServers();
+    const server = servers.find(s => s.id === id);
+    if (!server) return sendJson(res, 404, { error: 'Server not found' });
+    if (server.type === 'local') {
+      return sendJson(res, 400, { error: 'Use /api/stats/stream for local' });
+    }
+    // Fetch from remote agent
+    fetch(server.url + '/stats', {
+      headers: { 'X-API-Key': server.apiKey },
+      signal: AbortSignal.timeout(10000),
+    })
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(data => sendJson(res, 200, data))
+      .catch(e => sendJson(res, 500, { error: e.message }));
+    return;
+  }
+
   // GET /config - Load dashboard configuration
   if (req.method === 'GET' && pathname === '/config') {
     fs.readFile(CONFIG_FILE, 'utf8', (err, data) => {

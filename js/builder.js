@@ -624,7 +624,141 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
   });
+
+  // Servers modal
+  document.getElementById('btn-servers').addEventListener('click', openServersModal);
+  document.getElementById('servers-close').addEventListener('click', () => {
+    document.getElementById('servers-modal').style.display = 'none';
+  });
+  document.getElementById('server-add-btn').addEventListener('click', addServer);
+  document.getElementById('server-test-btn').addEventListener('click', testServerConnection);
 });
+
+async function openServersModal() {
+  document.getElementById('servers-modal').style.display = 'flex';
+  await loadServersList();
+}
+
+async function loadServersList() {
+  const container = document.getElementById('servers-list');
+  try {
+    const res = await fetch('/api/servers');
+    const data = await res.json();
+    if (!data.servers || data.servers.length === 0) {
+      container.innerHTML = '<p style="color:#8b949e;font-size:13px;">No servers configured. Add one below.</p>';
+      return;
+    }
+    container.innerHTML = data.servers.map(s => `
+      <div class="server-item" style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--bg-tertiary);border-radius:6px;margin-bottom:8px;">
+        <div>
+          <strong style="font-size:13px;">${_escHtml(s.name)}</strong>
+          ${s.type === 'local' ? '<span style="color:#8b949e;font-size:11px;margin-left:8px;">(built-in)</span>' : `<span style="color:#8b949e;font-size:11px;margin-left:8px;">${_escHtml(s.url || '')}</span>`}
+        </div>
+        <div style="display:flex;gap:6px;">
+          ${s.type !== 'local' ? `
+            <button class="btn btn-sm btn-secondary" onclick="testServer('${s.id}')">Test</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteServer('${s.id}')">Delete</button>
+          ` : '<span style="color:#3fb950;font-size:12px;">✓ Local</span>'}
+        </div>
+      </div>
+    `).join('');
+  } catch (e) {
+    container.innerHTML = '<p style="color:#f85149;">Failed to load servers</p>';
+  }
+}
+
+async function addServer() {
+  const name = document.getElementById('server-name').value.trim();
+  const url = document.getElementById('server-url').value.trim();
+  const apiKey = document.getElementById('server-apikey').value.trim();
+  const resultEl = document.getElementById('server-add-result');
+  
+  if (!name || !url || !apiKey) {
+    resultEl.innerHTML = '<span style="color:#f85149;">All fields are required</span>';
+    return;
+  }
+  
+  try {
+    const res = await fetch('/api/servers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, url, apiKey })
+    });
+    const data = await res.json();
+    if (data.status === 'success') {
+      resultEl.innerHTML = '<span style="color:#3fb950;">✓ Server added</span>';
+      document.getElementById('server-name').value = '';
+      document.getElementById('server-url').value = '';
+      document.getElementById('server-apikey').value = '';
+      await loadServersList();
+    } else {
+      resultEl.innerHTML = `<span style="color:#f85149;">${_escHtml(data.error || 'Failed to add')}</span>`;
+    }
+  } catch (e) {
+    resultEl.innerHTML = '<span style="color:#f85149;">Network error</span>';
+  }
+}
+
+async function testServerConnection() {
+  const url = document.getElementById('server-url').value.trim();
+  const apiKey = document.getElementById('server-apikey').value.trim();
+  const resultEl = document.getElementById('server-add-result');
+  
+  if (!url || !apiKey) {
+    resultEl.innerHTML = '<span style="color:#f85149;">URL and API Key required</span>';
+    return;
+  }
+  
+  resultEl.innerHTML = '<span style="color:#8b949e;">Testing...</span>';
+  try {
+    const res = await fetch(url + '/health', {
+      headers: { 'X-API-Key': apiKey },
+      signal: AbortSignal.timeout(5000)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      resultEl.innerHTML = `<span style="color:#3fb950;">✓ Connected to ${_escHtml(data.serverName || 'server')}</span>`;
+    } else {
+      resultEl.innerHTML = `<span style="color:#f85149;">HTTP ${res.status}</span>`;
+    }
+  } catch (e) {
+    resultEl.innerHTML = `<span style="color:#f85149;">Connection failed: ${_escHtml(e.message)}</span>`;
+  }
+}
+
+async function testServer(id) {
+  try {
+    const res = await fetch(`/api/servers/${id}/test`, { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      alert(`✓ Connected to ${data.serverName || 'server'}`);
+    } else {
+      alert(`Connection failed: ${data.message || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert('Network error');
+  }
+}
+
+async function deleteServer(id) {
+  if (!confirm('Delete this server?')) return;
+  try {
+    const res = await fetch(`/api/servers/${id}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.status === 'success') {
+      await loadServersList();
+    } else {
+      alert(data.error || 'Failed to delete');
+    }
+  } catch (e) {
+    alert('Network error');
+  }
+}
+
+function _escHtml(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
 
 function initCanvas() {
   const canvas = document.getElementById('canvas');
