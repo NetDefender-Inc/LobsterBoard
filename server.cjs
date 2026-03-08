@@ -11,6 +11,47 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const si = require('systeminformation');
+const crypto = require('crypto');
+
+// ─────────────────────────────────────────────
+// ECDH Crypto utilities for encrypted agent communication
+// ─────────────────────────────────────────────
+const ECDH_CURVE = 'prime256v1';
+const AES_ALGORITHM = 'aes-256-gcm';
+const IV_LENGTH = 12;
+const AUTH_TAG_LENGTH = 16;
+
+function generateEcdhKeyPair() {
+  const ecdh = crypto.createECDH(ECDH_CURVE);
+  ecdh.generateKeys();
+  return {
+    publicKey: ecdh.getPublicKey('base64'),
+    privateKey: ecdh.getPrivateKey('base64'),
+  };
+}
+
+function deriveSharedSecret(privateKeyBase64, theirPublicKeyBase64) {
+  const ecdh = crypto.createECDH(ECDH_CURVE);
+  ecdh.setPrivateKey(Buffer.from(privateKeyBase64, 'base64'));
+  const sharedPoint = ecdh.computeSecret(Buffer.from(theirPublicKeyBase64, 'base64'));
+  return crypto.createHash('sha256').update(sharedPoint).digest();
+}
+
+function decryptPayload(encryptedBase64, keyBuffer) {
+  const packed = Buffer.from(encryptedBase64, 'base64');
+  const iv = packed.subarray(0, IV_LENGTH);
+  const authTag = packed.subarray(IV_LENGTH, IV_LENGTH + AUTH_TAG_LENGTH);
+  const ciphertext = packed.subarray(IV_LENGTH + AUTH_TAG_LENGTH);
+  
+  const decipher = crypto.createDecipheriv(AES_ALGORITHM, keyBuffer, iv, { authTagLength: AUTH_TAG_LENGTH });
+  decipher.setAuthTag(authTag);
+  
+  const decrypted = Buffer.concat([
+    decipher.update(ciphertext),
+    decipher.final(),
+  ]);
+  return JSON.parse(decrypted.toString('utf8'));
+}
 
 const PORT = process.env.PORT || 8080;
 const HOST = process.env.HOST || '127.0.0.1';
@@ -300,7 +341,6 @@ const SECRETS_FILE = path.join(__dirname, 'secrets.json');
 // ─────────────────────────────────────────────
 // Server-side Session Authentication
 // ─────────────────────────────────────────────
-const crypto = require('crypto');
 
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || null;
 const SESSION_TTL_MS = (parseInt(process.env.SESSION_TTL_HOURS) || 24) * 60 * 60 * 1000;
@@ -1839,10 +1879,11 @@ const server = http.createServer(async (req, res) => {
   // GET /api/servers - List all servers
   if (req.method === 'GET' && pathname === '/api/servers') {
     const servers = loadServers();
-    // Mask API keys for security
+    // Mask API keys and secrets for security
     const masked = servers.map(s => ({
       ...s,
-      apiKey: s.apiKey ? s.apiKey.slice(0, 10) + '...' : undefined
+      apiKey: s.apiKey ? s.apiKey.slice(0, 10) + '...' : undefined,
+      sharedSecret: s.sharedSecret ? '🔐' : undefined, // Just indicate presence
     }));
     sendJson(res, 200, { servers: masked });
     return;
@@ -1852,7 +1893,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && pathname === '/api/servers') {
     let body = '';
     req.on('data', c => body += c);
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const { name, url, apiKey } = JSON.parse(body);
         if (!name || !url || !apiKey) {
@@ -1863,9 +1904,58 @@ const server = http.createServer(async (req, res) => {
         if (servers.find(s => s.id === id)) {
           return sendJson(res, 400, { error: 'Server with this name already exists' });
         }
-        servers.push({ id, name, url, apiKey, type: 'remote' });
+        
+        // Generate ECDH key pair for encrypted communication
+        const keyPair = generateEcdhKeyPair();
+        
+        // Perform handshake with agent
+        let sharedSecret = null;
+        let encrypted = false;
+        try {
+          const handshakeRes = await fetch(url + '/handshake', {
+            method: 'POST',
+            headers: { 
+              'X-API-Key': apiKey,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ 
+              clientId: id, 
+              publicKey: keyPair.publicKey,
+            }),
+            signal: AbortSignal.timeout(10000),
+          });
+          
+          if (handshakeRes.ok) {
+            const handshakeData = await handshakeRes.json();
+            if (handshakeData.publicKey) {
+              sharedSecret = deriveSharedSecret(keyPair.privateKey, handshakeData.publicKey);
+              encrypted = true;
+              console.log(`🔐 Encrypted connection established with server: ${name}`);
+            }
+          }
+        } catch (e) {
+          // Handshake failed - agent may not support encryption, continue without it
+          console.log(`⚠️ Handshake failed for ${name}, using unencrypted: ${e.message}`);
+        }
+        
+        const serverEntry = { 
+          id, 
+          name, 
+          url, 
+          apiKey, 
+          type: 'remote',
+          encrypted,
+        };
+        
+        // Store shared secret (base64 encoded) if encryption is enabled
+        if (sharedSecret) {
+          serverEntry.sharedSecret = sharedSecret.toString('base64');
+          serverEntry.clientId = id;
+        }
+        
+        servers.push(serverEntry);
         saveServers(servers);
-        sendJson(res, 200, { status: 'success', id });
+        sendJson(res, 200, { status: 'success', id, encrypted });
       } catch (e) {
         sendJson(res, 400, { error: e.message });
       }
@@ -1924,8 +2014,69 @@ const server = http.createServer(async (req, res) => {
       signal: AbortSignal.timeout(5000),
     })
       .then(r => r.json())
-      .then(data => sendJson(res, 200, { status: 'ok', serverName: data.serverName }))
+      .then(data => sendJson(res, 200, { 
+        status: 'ok', 
+        serverName: data.serverName,
+        agentEncryption: data.encrypted || false,
+        localEncryption: server.encrypted || false,
+      }))
       .catch(e => sendJson(res, 200, { status: 'error', message: e.message }));
+    return;
+  }
+
+  // POST /api/servers/:id/handshake - Re-establish encryption with a server
+  if (req.method === 'POST' && pathname.match(/^\/api\/servers\/[^/]+\/handshake$/)) {
+    const id = pathname.split('/')[3];
+    const servers = loadServers();
+    const serverIdx = servers.findIndex(s => s.id === id);
+    if (serverIdx === -1) return sendJson(res, 404, { error: 'Server not found' });
+    const server = servers[serverIdx];
+    if (server.type === 'local') {
+      return sendJson(res, 400, { error: 'Local server does not need handshake' });
+    }
+
+    (async () => {
+      try {
+        // Generate new key pair
+        const keyPair = generateEcdhKeyPair();
+        
+        const handshakeRes = await fetch(server.url + '/handshake', {
+          method: 'POST',
+          headers: { 
+            'X-API-Key': server.apiKey,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ 
+            clientId: id, 
+            publicKey: keyPair.publicKey,
+          }),
+          signal: AbortSignal.timeout(10000),
+        });
+        
+        if (!handshakeRes.ok) {
+          const err = await handshakeRes.json().catch(() => ({ error: 'HTTP ' + handshakeRes.status }));
+          return sendJson(res, 500, { error: err.error || 'Handshake failed' });
+        }
+        
+        const handshakeData = await handshakeRes.json();
+        if (!handshakeData.publicKey) {
+          return sendJson(res, 500, { error: 'Agent did not return public key' });
+        }
+        
+        const sharedSecret = deriveSharedSecret(keyPair.privateKey, handshakeData.publicKey);
+        
+        // Update server config
+        servers[serverIdx].encrypted = true;
+        servers[serverIdx].sharedSecret = sharedSecret.toString('base64');
+        servers[serverIdx].clientId = id;
+        saveServers(servers);
+        
+        console.log(`🔐 Re-established encrypted connection with server: ${server.name}`);
+        sendJson(res, 200, { status: 'ok', encrypted: true });
+      } catch (e) {
+        sendJson(res, 500, { error: e.message });
+      }
+    })();
     return;
   }
 
@@ -1938,16 +2089,40 @@ const server = http.createServer(async (req, res) => {
     if (server.type === 'local') {
       return sendJson(res, 400, { error: 'Use /api/stats/stream for local' });
     }
+    
+    // Build headers - include client ID if we have encryption set up
+    const headers = { 'X-API-Key': server.apiKey };
+    if (server.encrypted && server.clientId) {
+      headers['X-Client-ID'] = server.clientId;
+    }
+    
     // Fetch from remote agent
     fetch(server.url + '/stats', {
-      headers: { 'X-API-Key': server.apiKey },
+      headers,
       signal: AbortSignal.timeout(10000),
     })
       .then(r => {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
       })
-      .then(data => sendJson(res, 200, data))
+      .then(data => {
+        // Decrypt if response is encrypted
+        if (data.encrypted && server.sharedSecret) {
+          try {
+            const keyBuffer = Buffer.from(server.sharedSecret, 'base64');
+            const decrypted = decryptPayload(data.encrypted, keyBuffer);
+            decrypted._remote = true;
+            decrypted._encrypted = true;
+            return sendJson(res, 200, decrypted);
+          } catch (e) {
+            console.error('Decryption failed:', e.message);
+            return sendJson(res, 500, { error: 'Decryption failed: ' + e.message });
+          }
+        }
+        // Plain response (backward compatible)
+        data._remote = true;
+        sendJson(res, 200, data);
+      })
       .catch(e => sendJson(res, 500, { error: e.message }));
     return;
   }
